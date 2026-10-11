@@ -84,25 +84,70 @@ function Test-Admin {
     return $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-function Ensure-PythonAndMeson {
-    param([ref]$OutPythonExe)
-
-    $pythonExe = $null
-
+# ---------------------------------------------------------------
+# 0a. Locate a real Python (not the Microsoft Store stub)
+# ---------------------------------------------------------------
+function Find-PythonExe {
+    # 1) PATH entries, skipping the Store stubs
     foreach ($cmd in @("python.exe", "python3.exe")) {
         $p = Get-Command $cmd -ErrorAction SilentlyContinue
         if (-not $p) { continue }
-        if ($p.Source -like "*\WindowsApps\*") {
-            Write-Warn2 "Skipping Microsoft Store python stub at $($p.Source)"
-            continue
+        if ($p.Source -like "*\WindowsApps\*") { continue }
+        if (Test-NativeSuccess -Exe $p.Source -CmdArgs @("--version")) {
+            return $p.Source
         }
-        if (-not (Test-NativeSuccess -Exe $p.Source -CmdArgs @("--version"))) {
-            Write-Warn2 "python at $($p.Source) did not run cleanly - skipping"
-            continue
-        }
-        $pythonExe = $p.Source
-        break
     }
+
+    # 2) Standard install locations
+    $searchRoots = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python"),
+        "C:\Program Files",
+        "C:\Program Files (x86)"
+    )
+    foreach ($root in $searchRoots) {
+        if (-not (Test-Path $root)) { continue }
+        $dirs = @(Get-ChildItem $root -Directory -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -like "Python 3*" -or $_.Name -like "Python3*" } |
+            Sort-Object Name -Descending)
+        foreach ($d in $dirs) {
+            foreach ($name in @("python.exe", "python3.exe")) {
+                $exe = Join-Path $d.FullName $name
+                if (Test-Path $exe) { return $exe }
+            }
+        }
+    }
+
+    # 3) py.exe launcher (real one)
+    $py = Get-Command py.exe -ErrorAction SilentlyContinue
+    if ($py -and $py.Source -notlike "*\WindowsApps\*") {
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            $real = & $py.Source -3 -c "import sys; print(sys.executable)" 2>$null
+            if ($LASTEXITCODE -eq 0 -and $real -and (Test-Path $real)) {
+                return ($real.Trim())
+            }
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+    }
+
+    return $null
+}
+
+function Refresh-PathFromRegistry {
+    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath    = [Environment]::GetEnvironmentVariable("Path", "User")
+    $env:PATH    = "$machinePath;$userPath"
+}
+
+# ---------------------------------------------------------------
+# 0b. Ensure Python + Meson are available
+# ---------------------------------------------------------------
+function Ensure-PythonAndMeson {
+    param([ref]$OutPythonExe)
+
+    $pythonExe = Find-PythonExe
 
     if (-not $pythonExe) {
         Write-Warn2 "No real Python found - installing Python 3.12 via winget"
@@ -121,15 +166,32 @@ function Ensure-PythonAndMeson {
             '/quiet InstallAllUsers=0 PrependPath=1 Include_pip=1 Include_test=0 Include_launcher=1'
         }
 
-        Invoke-Checked -Exe $winget -CmdArgs @(
-            "install", "--id", "Python.Python.3.12", "-e",
-            "--scope", $scope,
-            "--silent",
-            "--accept-source-agreements",
-            "--accept-package-agreements",
-            "--override", $overrideArgs
-        ) -FailMessage "winget failed to install Python 3.12."
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
+        try {
+            & $winget install --id Python.Python.3.12 -e `
+                --scope $scope `
+                --silent `
+                --accept-source-agreements `
+                --accept-package-agreements `
+                --override $overrideArgs
+            $wingetCode = $LASTEXITCODE
+        } finally {
+            $ErrorActionPreference = $prev
+        }
 
+        # winget returns these when the package is already installed:
+        #   0x8A15002B (-1978335189): update not applicable
+        #   0x8A150014 (-1978335212): already installed
+        $alreadyInstalled = ($wingetCode -eq -1978335189) -or ($wingetCode -eq -1978335212)
+        if ($wingetCode -ne 0 -and -not $alreadyInstalled) {
+            throw "winget failed to install Python 3.12 (exit code $wingetCode)."
+        }
+        if ($alreadyInstalled) {
+            Write-Warn2 "winget reports Python already installed - re-detecting."
+        }
+
+        # Disable the Store stubs if they still exist
         Write-Host "    Disabling Microsoft Store python stubs..."
         try {
             Get-AppxPackage PythonSoftwareFoundation.PythonManager -ErrorAction SilentlyContinue |
@@ -144,26 +206,25 @@ function Ensure-PythonAndMeson {
             }
         }
 
-        $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-        $userPath    = [Environment]::GetEnvironmentVariable("Path", "User")
-        $env:PATH    = "$machinePath;$userPath"
-
-        $p = Get-Command python.exe -ErrorAction SilentlyContinue
-        if (-not $p) {
-            throw "Python was installed but is still not on PATH in this session. Close and reopen the terminal, then re-run the script."
+        # Refresh PATH and try to find Python again
+        Refresh-PathFromRegistry
+        $pythonExe = Find-PythonExe
+        if (-not $pythonExe) {
+            throw "Python was installed but could not be located. Close and reopen the terminal, then re-run the script."
         }
-        $pythonExe = $p.Source
-        Write-Ok "Python installed: $pythonExe"
+        Write-Ok "Python: $pythonExe"
     } else {
         Write-Ok "Python found: $pythonExe"
     }
 
+    # pip
     if (-not (Test-NativeSuccess -Exe $pythonExe -CmdArgs @("-m", "pip", "--version"))) {
         Write-Warn2 "pip not found - trying ensurepip"
         Invoke-Checked -Exe $pythonExe -CmdArgs @("-m", "ensurepip", "--upgrade") `
             -FailMessage "Could not bootstrap pip."
     }
 
+    # Meson
     if (-not (Test-NativeSuccess -Exe $pythonExe -CmdArgs @("-m", "mesonbuild.mesonmain", "--version"))) {
         Write-Warn2 "Meson not found - installing with pip"
         Invoke-Checked -Exe $pythonExe -CmdArgs @("-m", "pip", "install", "--user", "meson") `
@@ -433,9 +494,11 @@ Write-Step "Rubber Band: building from source with Meson"
 
 $rbDir     = Join-Path $thirdParty "rubberband"
 $rbLibFile = Join-Path $rbDir "lib\librubberband.a"
+$rbBuilt   = $false
 
 if ((Test-Path (Join-Path $rbDir "include")) -and (Test-Path $rbLibFile)) {
     Write-Ok "Rubber Band already built - skipping."
+    $rbBuilt = $true
 } else {
 
     $pythonExe = $null
@@ -492,6 +555,7 @@ if ((Test-Path (Join-Path $rbDir "include")) -and (Test-Path $rbLibFile)) {
         throw "Rubber Band build reported success but $rbLibFile is missing."
     }
     Write-Ok "Rubber Band built: $rbLibFile"
+    $rbBuilt = $true
 }
 
 # ---------------------------------------------------------------
@@ -512,37 +576,45 @@ $rbLib     = ToQmakePath (Join-Path $rbDir     "lib")
 # Use a distinct name so we do not clobber $compilerBin from section 1.
 $compilerBinQmake = ToQmakePath $compilerBin
 
-$depsLines = @(
-    "# ----- AUTO-GENERATED BY setup_audio_deps.ps1 -----",
-    "# Do not edit manually - will be overwritten.",
-    "",
-    "# FFmpeg (shared)",
-    "INCLUDEPATH += `"$ffmpegInc`"",
-    "LIBS += -L`"$ffmpegLib`" -lavformat -lavcodec -lavutil -lswresample",
-    "DEFINES += HAVE_FFMPEG",
-    "FFMPEG_BIN_DIR = `"$ffmpegBin`"",
-    "",
-    "# SoundTouch (static)",
-    "INCLUDEPATH += `"$stInc`"",
-    "LIBS += -L`"$stLib`" -lSoundTouch",
-    "DEFINES += HAVE_SOUNDTOUCH",
-    "",
-    "# Rubber Band (static)",
-    "INCLUDEPATH += `"$rbInc`"",
-    "LIBS += -L`"$rbLib`" -lrubberband",
-    "DEFINES += HAVE_RUBBERBAND",
-    "",
-    "# Compiler runtime DLLs (llvm-mingw / MinGW)",
-    "COMPILER_BIN_DIR = `"$compilerBinQmake`"",
-    "",
-    "# ----- AUTO-GENERATED BY setup_audio_deps.ps1 -----"
-)
+$depsLines = New-Object System.Collections.Generic.List[string]
+$depsLines.Add("# ----- AUTO-GENERATED BY setup_audio_deps.ps1 -----")
+$depsLines.Add("# Do not edit manually - will be overwritten.")
+$depsLines.Add("")
+$depsLines.Add("# FFmpeg (shared)")
+$depsLines.Add("INCLUDEPATH += `"$ffmpegInc`"")
+$depsLines.Add("LIBS += -L`"$ffmpegLib`" -lavformat -lavcodec -lavutil -lswresample")
+$depsLines.Add("DEFINES += HAVE_FFMPEG")
+$depsLines.Add("FFMPEG_BIN_DIR = `"$ffmpegBin`"")
+$depsLines.Add("")
+$depsLines.Add("# SoundTouch (static)")
+$depsLines.Add("INCLUDEPATH += `"$stInc`"")
+$depsLines.Add("LIBS += -L`"$stLib`" -lSoundTouch")
+$depsLines.Add("DEFINES += HAVE_SOUNDTOUCH")
+$depsLines.Add("")
+
+if ($rbBuilt) {
+    $depsLines.Add("# Rubber Band (static)")
+    $depsLines.Add("INCLUDEPATH += `"$rbInc`"")
+    $depsLines.Add("LIBS += -L`"$rbLib`" -lrubberband")
+    $depsLines.Add("DEFINES += HAVE_RUBBERBAND")
+} else {
+    $depsLines.Add("# Rubber Band: NOT BUILT - no library, no defines")
+}
+$depsLines.Add("")
+$depsLines.Add("# Compiler runtime DLLs (llvm-mingw / MinGW)")
+$depsLines.Add("COMPILER_BIN_DIR = `"$compilerBinQmake`"")
+$depsLines.Add("")
+$depsLines.Add("# ----- AUTO-GENERATED BY setup_audio_deps.ps1 -----")
 
 $depsText = ($depsLines -join "`r`n") + "`r`n"
 $depsPath = Join-Path $thirdParty "deps.pri"
 
 [System.IO.File]::WriteAllText($depsPath, $depsText, [System.Text.Encoding]::ASCII)
 Write-Ok "written $depsPath"
+
+if (-not $rbBuilt) {
+    Write-Warn2 "Rubber Band was not built - deps.pri written WITHOUT -lrubberband."
+}
 
 # ---------------------------------------------------------------
 # 6. Copy DLLs
